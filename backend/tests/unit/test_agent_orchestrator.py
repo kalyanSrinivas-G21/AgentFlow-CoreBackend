@@ -3,7 +3,7 @@ import pytest
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 from app.agents.orchestrator import AgentOrchestrator
-from app.agents.schemas import PlanStepDraft, ValidationResult
+from app.agents.validator import ValidationResult
 
 async def mock_db_refresh(obj):
     """Simulate SQLAlchemy populating the ID after a commit/refresh."""
@@ -29,9 +29,9 @@ async def test_agent_orchestrator_success():
     orchestrator = AgentOrchestrator(db_mock, redis_mock)
     
     # Mock Planner to return 1 step
-    orchestrator.planner.plan = AsyncMock(return_value=[
-        PlanStepDraft(tool_name="mock_tool", args={"key": "val"}, reason="test")
-    ])
+    orchestrator.planner.plan = AsyncMock(return_value={
+        "steps": [{"tool": "mock_tool", "tool_args": {"key": "val"}}]
+    })
     
     # Mock Executor
     orchestrator.executor.execute_step = AsyncMock()
@@ -57,9 +57,9 @@ async def test_agent_orchestrator_retry_then_pass():
     task_mock.input_payload = {"prompt": "Do something"}
 
     orchestrator = AgentOrchestrator(db_mock, redis_mock)
-    orchestrator.planner.plan = AsyncMock(return_value=[
-        PlanStepDraft(tool_name="mock_tool", args={}, reason="test")
-    ])
+    orchestrator.planner.plan = AsyncMock(return_value={
+        "steps": [{"tool": "mock_tool", "tool_args": {}}]
+    })
     orchestrator.executor.execute_step = AsyncMock()
     
     # Validator fails first time, passes second time
@@ -91,9 +91,9 @@ async def test_agent_orchestrator_hard_cap():
     orchestrator = AgentOrchestrator(db_mock, redis_mock)
     
     # Planner returns 10 steps (above the cap of 6)
-    orchestrator.planner.plan = AsyncMock(return_value=[
-        PlanStepDraft(tool_name=f"tool_{i}", args={}, reason="test") for i in range(10)
-    ])
+    orchestrator.planner.plan = AsyncMock(return_value={
+        "steps": [{"tool": f"tool_{i}", "tool_args": {}} for i in range(10)]
+    })
     orchestrator.executor.execute_step = AsyncMock()
     orchestrator.validator.validate = AsyncMock(return_value=ValidationResult(passed=True, reason="ok"))
 

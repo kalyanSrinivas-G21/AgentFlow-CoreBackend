@@ -1,18 +1,20 @@
-import base64
-import io
+# backend/app/tools/document_tools.py
 import os
-import pypdfium2 as pdfium
+import magic
 from typing import Dict, Any
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.tools.base import Tool, register_tool
+from app.tools.models import ToolResult
 from app.workspace.service import WorkspaceService
+from app.workspace.parsers.registry import DocumentParserRegistry
 from app.models_ai.ollama_provider import OllamaProvider
-from app.models_ai.tier_router import TierRouter
+from app.models_ai.router import ModelRouter
 from app.workspace.embedding_service import EmbeddingService
 from app.workspace.models import DocumentChunk
+from app.workspace.models import File
 
 class ExtractInput(BaseModel):
     file_path: str = Field(..., description="Relative path of the document to extract")
@@ -21,46 +23,36 @@ class ExtractInput(BaseModel):
 @register_tool
 class DocumentExtractTool(Tool):
     name = "document.extract"
+    description = "Extracts text from a document natively or via PaddleOCR."
     input_schema = ExtractInput
     timeout_s = 60.0
     retryable = True
 
-    async def run(self, args: Dict[str, Any], project_id: str, db: AsyncSession = None) -> str:
+    async def run(self, args: Dict[str, Any], project_id: str, db: AsyncSession = None) -> ToolResult:
         if not db:
-            raise ValueError("Database session required for document.extract")
+            return ToolResult(success=False, error="Database session required")
 
-        parsed = self.input_schema(**args)
-        target = WorkspaceService.resolve_path(project_id, parsed.file_path)
+        target = WorkspaceService.resolve_path(project_id, args["file_path"])
         
-        images_b64 = []
-        
-        if target.suffix.lower() == ".pdf":
-            # Rasterize PDF pages to images for the local VLM
-            pdf = pdfium.PdfDocument(str(target))
-            for i in range(min(len(pdf), 20)):  # Cap at 20 pages for local VRAM limits
-                page = pdf[i]
-                bitmap = page.render(scale=2)
-                pil_image = bitmap.to_pil()
-                buffered = io.BytesIO()
-                pil_image.save(buffered, format="JPEG")
-                images_b64.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
-        else:
-            with target.open("rb") as f:
-                images_b64.append(base64.b64encode(f.read()).decode("utf-8"))
+        if not target.exists():
+            return ToolResult(success=False, error="File not found")
 
-        # Initialize local VLM (Tier 2)
-        router = TierRouter()
-        vlm_model = router.get_model_for_tier(2)
-        provider = OllamaProvider(base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
+        # Step 8.3: Direct Native Parsing routing (Saves VRAM)
+        mime_type = magic.from_file(str(target), mime=True)
         
-        prompt = "Extract all text and structured data from this document verbatim. Provide a summary at the top."
-        extracted_text = await provider.generate(model=vlm_model, prompt=prompt, images=images_b64)
+        try:
+            extracted_text = DocumentParserRegistry.parse(target, mime_type)
+        except Exception as e:
+            return ToolResult(success=False, error=f"Parsing failed: {str(e)}")
         
-        # Save to Local Vector Database
         embedding_service = EmbeddingService(db)
-        await embedding_service.chunk_and_embed(parsed.file_id, extracted_text)
+        await embedding_service.chunk_and_embed(args["file_id"], extracted_text)
         
-        return f"Extraction Complete and Indexed. Length: {len(extracted_text)} chars.\n\nSummary:\n{extracted_text[:500]}..."
+        return ToolResult(
+            success=True, 
+            output=f"Extraction Complete. Summary: {extracted_text[:300]}...",
+            metadata={"chars": len(extracted_text), "parser": "native_or_paddleocr"}
+        )
 
 class QueryInput(BaseModel):
     file_id: str = Field(..., description="UUID of the file to query")
@@ -69,40 +61,42 @@ class QueryInput(BaseModel):
 @register_tool
 class DocumentQueryTool(Tool):
     name = "document.query"
+    description = "Queries an indexed document using RAG."
     input_schema = QueryInput
     timeout_s = 45.0
     retryable = True
 
-    async def run(self, args: Dict[str, Any], project_id: str, db: AsyncSession = None) -> str:
+    async def run(self, args: Dict[str, Any], project_id: str, db: AsyncSession = None) -> ToolResult:
         if not db:
-            raise ValueError("Database session required for document.query")
+            return ToolResult(success=False, error="Database session required")
 
-        parsed = self.input_schema(**args)
         provider = OllamaProvider(base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
+        question_embedding = await provider.embed("nomic-embed-text", args["question"])
 
-        # 1. Embed the Question
-        question_embedding = await provider.embed("nomic-embed-text", parsed.question)
-
-        # 2. Vector Search using pgvector Cosine Distance (<=>)
-        stmt = select(DocumentChunk).where(
-            DocumentChunk.file_id == parsed.file_id
-        ).order_by(
-            DocumentChunk.embedding.cosine_distance(question_embedding)
-        ).limit(3)
+        # Step 8.5: Project Scope Integrity (JOIN on File)
+        stmt = (
+            select(DocumentChunk)
+            .join(File, DocumentChunk.file_id == File.id)
+            .where(
+                DocumentChunk.file_id == args["file_id"],
+                File.project_id == project_id  # SECURITY: Prevent cross-tenant leakage
+            )
+            .order_by(DocumentChunk.embedding.cosine_distance(question_embedding))
+            .limit(3)
+        )
 
         result = await db.execute(stmt)
         top_chunks = result.scalars().all()
 
         if not top_chunks:
-            return "No document content found for the given file_id."
+            return ToolResult(success=False, error="No document content found for the given file_id or project.")
 
         context_text = "\n\n".join([c.text for c in top_chunks])
 
-        # 3. Tier-1 RAG Synthesis
-        router = TierRouter()
-        tier1_model = router.get_model_for_tier(1)
+        router = ModelRouter()
+        tier1_model = router.route(required_capabilities=["general"])
 
-        prompt = f"Context:\n{context_text}\n\nQuestion: {parsed.question}\nAnswer concisely based only on the context."
+        prompt = f"Context:\n{context_text}\n\nQuestion: {args['question']}\nAnswer concisely based only on the context."
         answer = await provider.generate(model=tier1_model, prompt=prompt)
 
-        return answer
+        return ToolResult(success=True, output=answer, metadata={"chunks_retrieved": len(top_chunks), "model_used": tier1_model})

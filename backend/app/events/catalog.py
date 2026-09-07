@@ -3,6 +3,7 @@ Event Catalog: Hardcoded string constants for all system events.
 """
 
 TASK_CREATED = "task.created"
+TASK_QUEUED = "task.queued"
 TASK_UPDATED = "task.updated"
 TASK_COMPLETED = "task.completed"
 TASK_FAILED = "task.failed"

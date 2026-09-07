@@ -6,10 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.monitoring.models import ResourceMetric
-from app.security.auth import get_current_actor
+from app.security.auth import get_current_user
 
-# Both endpoints require the Stage 12 authentication dependency
-router = APIRouter(tags=["monitoring"], dependencies=[Depends(get_current_actor)])
+# Both endpoints require the JWT authentication dependency
+router = APIRouter(tags=["monitoring"], dependencies=[Depends(get_current_user)])
 
 @router.get("/api/v1/metrics/latest")
 async def get_latest_metrics(db: AsyncSession = Depends(get_db)):

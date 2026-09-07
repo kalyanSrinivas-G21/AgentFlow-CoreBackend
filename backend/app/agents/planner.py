@@ -1,48 +1,45 @@
 # backend/app/agents/planner.py
-import os
 import json
 import logging
-from typing import List, Optional
-from app.agents.schemas import PlanDraft, PlanStepDraft
+from pydantic import BaseModel
+from typing import List, Dict, Any
 from app.models_ai.tier_router import TierRouter
-from app.models_ai.ollama_provider import OllamaProvider
+try:
+    from app.models_ai.provider import OllamaProvider
+except ImportError:
+    from app.models_ai.ollama_provider import OllamaProvider
 
 logger = logging.getLogger(__name__)
 
+class StepSchema(BaseModel):
+    tool: str
+    tool_args: Dict[str, Any]
+
+class PlanSchema(BaseModel):
+    steps: List[StepSchema]
+
 class Planner:
-    def __init__(self):
-        self.tier_router = TierRouter()
-        self.model = self.tier_router.get_model_for_tier(1)
-        self.provider = OllamaProvider(base_url=os.getenv("OLLAMA_BASE_URL", "http://ollama:11434"))
-
-    async def plan(self, prompt: str, prior_failure: Optional[str] = None) -> List[PlanStepDraft]:
-        system_prompt = (
-            "You are an expert AI planner. Break down the user's objective into a logical sequence of tool executions. "
-            "Output valid JSON conforming exactly to the requested schema."
-        )
+    async def plan(self, objective: str, feedback: str = None) -> dict:
+        logger.info(f"Planning for objective: {objective}")
+        model_name = TierRouter.get_model_for_tier(1)
+        provider = OllamaProvider(model_name)
         
-        user_prompt = f"Objective: {prompt}"
-        if prior_failure:
-            user_prompt += f"\n\nWARNING: Your previous plan failed validation. Reason: {prior_failure}. " \
-                           f"Adjust your steps to resolve this failure."
-
-        schema = PlanDraft.model_json_schema()
+        system_prompt = "You are a planning agent. Break down the objective into a list of tool steps. Output JSON matching the schema."
+        prompt_text = f"Objective: {objective}\nReturn JSON with a 'steps' array. Each step needs 'tool' and 'tool_args'."
+        
+        if feedback:
+            prompt_text += f"\nPrevious attempt failed. Feedback: {feedback}\nPlease adjust your plan."
         
         try:
-            logger.info(f"Planner requesting plan from {self.model}...")
-            response = await self.provider.generate_structured(
-                model=self.model,
-                prompt=user_prompt,
-                schema=schema,
-                system=system_prompt
+            response = await provider.generate(
+                prompt=prompt_text,
+                system=system_prompt,
+                format="json"
             )
             
-            if "error" in response:
-                raise ValueError(f"Planner LLM generation error: {response['error']}")
-                
-            steps = response.get("steps", [])
-            return [PlanStepDraft(**step) for step in steps]
-            
+            data = json.loads(response.content)
+            PlanSchema(**data)
+            return data
         except Exception as e:
-            logger.exception("Failed to generate plan.")
-            raise
+            logger.error(f"Planning failed: {e}")
+            return {"steps": []}

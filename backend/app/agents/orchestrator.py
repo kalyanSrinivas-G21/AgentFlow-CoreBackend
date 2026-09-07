@@ -1,150 +1,86 @@
-# backend/app/agents/orchestrator.py (MODIFIED)
+# backend/app/agents/orchestrator.py
 import logging
-from app.tasks.models import AgentRun, PlanStep
-from app.events.publisher import publish
-from app.events.envelope import EventEnvelope
-from app.agents.planner import Planner
-from app.agents.executor import Executor
-from app.agents.validator import Validator
+import asyncio
+from typing import Dict, Any
+from app.tasks.models import Task
+from app.agents.graph import WorkflowGraph, AgentState
+from app.sandbox.runner import run_in_sandbox
 
 logger = logging.getLogger(__name__)
 
+class ToolExecutor:
+    """Safely bridges LangGraph step requests to the secure Sandbox."""
+    async def execute_step(self, step, task_id: str) -> Any:
+        class ToolResult:
+            def __init__(self, success, output, error):
+                self.success = success
+                self.output = output
+                self.error = error
+                
+        if step.tool_name == "sandbox":
+            try:
+                # The sandbox requires a dictionary of filenames to string content
+                files = step.tool_args.get("files", {"main.py": step.tool_args.get("code", "")})
+                command = step.tool_args.get("command", ["python", "main.py"])
+                
+                result = await run_in_sandbox(files=files, command=command)
+                
+                if result.exit_code == 0:
+                    return ToolResult(True, result.stdout, None)
+                else:
+                    return ToolResult(False, None, f"Exit {result.exit_code}: {result.stderr}")
+            except Exception as e:
+                logger.error(f"Sandbox Tool Exception: {e}")
+                return ToolResult(False, None, str(e))
+                
+        return ToolResult(False, None, f"Unknown tool: {step.tool_name}")
+
 class AgentOrchestrator:
+    """Manages the lifecycle of a LangGraph agent run."""
     def __init__(self, db_session, redis_client):
         self.db = db_session
         self.redis = redis_client
-        self.planner = Planner()
-        self.executor = Executor(self.db, self.redis)
-        self.validator = Validator(self.db)  # <-- MODIFIED: Passed DB session to Validator
+        self.executor = ToolExecutor()
 
-    async def run(self, task) -> dict:
-        """Main agentic loop: Plan -> Execute -> Validate -> (Complete | Retry | Fail)"""
-        logger.info(f"Starting Agent Orchestrator for Task {task.id}")
-
-        agent_run = AgentRun(task_id=task.id, status="RUNNING")
-        self.db.add(agent_run)
-        
-        run_started_evt = EventEnvelope(
-            event_type="agent.run.started",
-            source="agent_orchestrator",
-            task_id=task.id,
-            correlation_id=task.id,
-            payload={"status": "RUNNING"}
-        )
-        await publish(self.db, self.redis, run_started_evt)
-        await self.db.commit()
-        await self.db.refresh(agent_run)
-
-        max_retries = 1
-        max_total_steps = 6
-        steps_executed = 0
-        prior_failure = None
-
+    async def run(self, task: Task) -> Dict[str, Any]:
+        """
+        Executes the agentic workflow and returns the final payload.
+        """
         try:
-            prompt = str(task.input_payload.get("prompt", task.input_payload) if isinstance(task.input_payload, dict) else task.input_payload)
+            workflow = WorkflowGraph(self.db, self.redis, self.executor)
+            graph_app = workflow.build()
+            
+            # Handle string inputs gracefully
+            if isinstance(task.input_payload, dict):
+                objective = task.input_payload.get("prompt", "") or task.input_payload.get("objective", "")
+            else:
+                objective = str(task.input_payload)
 
-            for attempt in range(max_retries + 1):
-                logger.info(f"Agent Loop Attempt {attempt + 1}")
+            initial_state: AgentState = {
+                "objective": objective,
+                "project_id": str(task.project_id),
+                "task_id": str(task.id),
+                "context": [],
+                "plan": [],
+                "current_step_index": 0,
+                "step_results": [],
+                "step_count": 0,
+                "max_steps": 10,
+                "final_answer": ""
+            }
 
-                await self.db.refresh(task)
-                if task.status in ("CANCEL_REQUESTED", "CANCELLED"):
-                    agent_run.status = "CANCELLED"
-                    await self.db.commit()
-                    return {"error": "Task was cancelled by user."}
-
-                draft_steps = await self.planner.plan(prompt, prior_failure)
-                
-                plan_created_evt = EventEnvelope(
-                    event_type="agent.plan.created",
-                    source="agent_orchestrator",
-                    task_id=task.id,
-                    correlation_id=agent_run.id,
-                    payload={"step_count": len(draft_steps), "attempt": attempt + 1}
-                )
-                await publish(self.db, self.redis, plan_created_evt)
-                await self.db.commit()
-
-                for draft in draft_steps:
-                    if steps_executed >= max_total_steps:
-                        logger.warning(f"Iteration cap ({max_total_steps}) reached.")
-                        break
-
-                    plan_step = PlanStep(
-                        agent_run_id=agent_run.id,
-                        step_number=steps_executed + 1,
-                        tool_name=draft.tool_name,
-                        tool_args=draft.args,
-                        reason=draft.reason,
-                        status="QUEUED"
-                    )
-                    self.db.add(plan_step)
-                    await self.db.commit()
-                    await self.db.refresh(plan_step)
-
-                    await self.executor.execute_step(plan_step, task.id)
-                    steps_executed += 1
-
-                val_started_evt = EventEnvelope(
-                    event_type="validation.started",
-                    source="agent_validator",
-                    task_id=task.id,
-                    correlation_id=agent_run.id,
-                    payload={}
-                )
-                await publish(self.db, self.redis, val_started_evt)
-                await self.db.commit()
-
-                validation_result = await self.validator.validate(agent_run, task) # <-- MODIFIED: Passing task object directly
-
-                if validation_result.passed:
-                    val_passed_evt = EventEnvelope(
-                        event_type="validation.passed",
-                        source="agent_validator",
-                        task_id=task.id,
-                        correlation_id=agent_run.id,
-                        payload={"reason": validation_result.reason}
-                    )
-                    await publish(self.db, self.redis, val_passed_evt)
-                    
-                    agent_run.status = "COMPLETED"
-                    run_completed_evt = EventEnvelope(
-                        event_type="agent.run.completed",
-                        source="agent_orchestrator",
-                        task_id=task.id,
-                        correlation_id=agent_run.id,
-                        payload={"status": "COMPLETED"}
-                    )
-                    await publish(self.db, self.redis, run_completed_evt)
-                    await self.db.commit()
-                    return {"status": "success", "steps_executed": steps_executed}
-                else:
-                    logger.warning(f"Validation failed: {validation_result.reason}")
-                    prior_failure = validation_result.reason
-
-            logger.error("Agent run failed to pass validation within retry limits.")
-            agent_run.status = "FAILED"
-            run_failed_evt = EventEnvelope(
-                event_type="agent.run.failed",
-                source="agent_orchestrator",
-                task_id=task.id,
-                correlation_id=agent_run.id,
-                payload={"error": "Max retries exceeded", "last_failure": prior_failure}
-            )
-            await publish(self.db, self.redis, run_failed_evt)
-            await self.db.commit()
-            return {"error": "Validation failed after max retries", "reason": prior_failure}
-
+            logger.info(f"Starting AgentOrchestrator for task {task.id}")
+            
+            # Call ainvoke on the compiled graph, not the wrapper class
+            final_state = await graph_app.ainvoke(initial_state)
+            
+            return {
+                "status": "success",
+                "final_answer": final_state.get("final_answer", ""),
+                "steps_taken": final_state.get("step_count", 0),
+                "tool_results": final_state.get("step_results", [])
+            }
+            
         except Exception as e:
-            logger.exception("Fatal error in agent loop.")
-            await self.db.rollback()
-            agent_run.status = "FAILED"
-            run_failed_evt = EventEnvelope(
-                event_type="agent.run.failed",
-                source="agent_orchestrator",
-                task_id=task.id,
-                correlation_id=agent_run.id,
-                payload={"error": str(e)}
-            )
-            await publish(self.db, self.redis, run_failed_evt)
-            await self.db.commit()
-            raise
+            logger.exception(f"Agent Orchestrator failed catastrophically: {e}")
+            return {"status": "error", "error_detail": str(e)}

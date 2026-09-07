@@ -10,23 +10,18 @@ from alembic import context
 # 1. Base Metadata
 from app.db import Base
 
-# 2. Core domain models
+# 2. Core domain models (Canonical Paths Enforced)
 from app.tasks.models import Project, Task
-from app.events.models import EventRecord  # <-- CRITICAL FIX: Tracking real events table
-
-# 3. Agent & Tool Models (Depend on Tasks)
 from app.agents.models import AgentRun, PlanStep
+from app.tools.models import ToolExecution
+
+# 3. Defensive imports for other modules not yet fully stabilized in Phase 1
 try:
-    from app.tools.models import ToolExecution
+    from app.events.models import EventRecord
 except ImportError:
     pass
-
-# 4. Workspace & RAG Models (Depend on Projects/Files)
-from app.workspace.models import File, DocumentChunk
-
-# 5. Optional Extracurriculums
 try:
-    from app.models_ai.registry_model import ModelRegistryEntry
+    from app.workspace.models import File, DocumentChunk
 except ImportError:
     pass
 try:

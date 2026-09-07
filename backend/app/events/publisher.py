@@ -2,15 +2,15 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from redis.asyncio import Redis
 from app.events.envelope import EventEnvelope
-from app.events.models import EventRecord
+from app.events.models import EventRecord, OutboxEvent
 
 async def publish(db_session: AsyncSession, redis_client: Redis, envelope: EventEnvelope) -> None:
     """
-    Durably publishes an event using a two-phase commit:
-    1. Persist to PostgreSQL (authoritative log)
-    2. Inject into the appropriate Redis stream
+    Transactional Outbox Publisher.
+    Writes the event log and the outbox message to the active PostgreSQL transaction.
+    Does NOT commit the transaction or directly contact Redis.
     """
-    # 1. Persist to Postgres
+    # 1. Persist to Postgres (Authoritative Audit Log)
     db_event = EventRecord(
         id=envelope.event_id,
         event_type=envelope.event_type,
@@ -23,15 +23,15 @@ async def publish(db_session: AsyncSession, redis_client: Redis, envelope: Event
         payload=envelope.payload,
         schema_version=envelope.schema_version
     )
-    
     db_session.add(db_event)
-    await db_session.flush()
-    await db_session.commit()
-
-    # 2. Publish to Redis Stream
-    stream_name = envelope.stream_name
-    event_data = {
-        "envelope": envelope.model_dump_json()
-    }
     
-    await redis_client.xadd(stream_name, event_data)
+    # 2. Persist to Transactional Outbox (Pending Redis Delivery)
+    outbox_event = OutboxEvent(
+        stream_name=envelope.stream_name,
+        event_payload=envelope.model_dump_json(),
+        idempotency_key=envelope.idempotency_key
+    )
+    db_session.add(outbox_event)
+    
+    # Flush to ensure schema violations are caught immediately within the caller's transaction
+    await db_session.flush()

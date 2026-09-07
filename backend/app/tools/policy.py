@@ -4,7 +4,6 @@ from uuid import UUID
 from pydantic import BaseModel, ValidationError
 from app.tools.base import TOOL_REGISTRY
 from app.workspace.service import WorkspaceService, SecurityError
-import app.tools.filesystem_tools  # Ensure filesystem tools are registered
 
 logger = logging.getLogger(__name__)
 
