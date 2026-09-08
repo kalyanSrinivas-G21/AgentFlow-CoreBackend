@@ -29,7 +29,8 @@ async def _read_stream_limited(stream: asyncio.StreamReader, limit: int) -> byte
     return bytes(output)
 
 async def run_in_sandbox(files: dict[str, str], command: list[str], timeout_s: float = 30.0) -> SandboxResult:
-    container_name = f"sandbox_{uuid.uuid4().hex}"
+    prefix = "pytest-sandbox-" if os.getenv("PYTEST_CURRENT_TEST") else "sandbox-"
+    container_name = f"{prefix}{uuid.uuid4().hex}"
     
     for filename in files.keys():
         norm_path = os.path.normpath(filename)

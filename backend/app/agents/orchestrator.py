@@ -1,86 +1,89 @@
-# backend/app/agents/orchestrator.py
 import logging
-import asyncio
-from typing import Dict, Any
+import os
+from types import SimpleNamespace
+from typing import Any, Dict
+from uuid import uuid4
+
+from app.agents.approval import InMemoryApprovalGate
+from app.agents.graph import AgentState, WorkflowGraph
+from app.agents.trace_store import SqlAlchemyExecutionTraceSink
+from app.agents.executor import Executor
+from app.models_ai.router_v2 import ModelRouter
+from app.models_ai.runtime import OllamaRuntime
 from app.tasks.models import Task
-from app.agents.graph import WorkflowGraph, AgentState
-from app.sandbox.runner import run_in_sandbox
 
 logger = logging.getLogger(__name__)
 
-class ToolExecutor:
-    """Safely bridges LangGraph step requests to the secure Sandbox."""
-    async def execute_step(self, step, task_id: str) -> Any:
-        class ToolResult:
-            def __init__(self, success, output, error):
-                self.success = success
-                self.output = output
-                self.error = error
-                
-        if step.tool_name == "sandbox":
-            try:
-                # The sandbox requires a dictionary of filenames to string content
-                files = step.tool_args.get("files", {"main.py": step.tool_args.get("code", "")})
-                command = step.tool_args.get("command", ["python", "main.py"])
-                
-                result = await run_in_sandbox(files=files, command=command)
-                
-                if result.exit_code == 0:
-                    return ToolResult(True, result.stdout, None)
-                else:
-                    return ToolResult(False, None, f"Exit {result.exit_code}: {result.stderr}")
-            except Exception as e:
-                logger.error(f"Sandbox Tool Exception: {e}")
-                return ToolResult(False, None, str(e))
-                
-        return ToolResult(False, None, f"Unknown tool: {step.tool_name}")
 
 class AgentOrchestrator:
-    """Manages the lifecycle of a LangGraph agent run."""
-    def __init__(self, db_session, redis_client):
+    """Manages a bounded graph run and returns safe execution state."""
+
+    def __init__(self, db_session, redis_client, *, runtime=None, trace_sink=None, approval_gate=None, executor=None):
         self.db = db_session
         self.redis = redis_client
-        self.executor = ToolExecutor()
+        self.runtime = runtime or OllamaRuntime()
+        self.trace_sink = trace_sink or SqlAlchemyExecutionTraceSink(db_session)
+        self.approval_gate = approval_gate or InMemoryApprovalGate()
+        self.executor = executor or Executor(db_session, redis_client)
 
     async def run(self, task: Task) -> Dict[str, Any]:
-        """
-        Executes the agentic workflow and returns the final payload.
-        """
+        execution_id = uuid4()
+        objective = task.input_payload.get("prompt", "") if isinstance(task.input_payload, dict) else str(task.input_payload)
+        initial_state: AgentState = {
+            "objective": objective,
+            "project_id": str(task.project_id),
+            "task_id": str(task.id),
+            "execution_id": str(execution_id),
+            "context": [],
+            "plan": [],
+            "current_step_index": 0,
+            "step_results": [],
+            "step_count": 0,
+            "max_steps": int(os.getenv("AGENT_MAX_STEPS", "10")),
+            "retry_count": 0,
+            "max_retries": int(os.getenv("AGENT_MAX_RETRIES", "2")),
+            "final_answer": "",
+            "status": "in_progress",
+            "awaiting_approval": False,
+        }
+
         try:
-            workflow = WorkflowGraph(self.db, self.redis, self.executor)
-            graph_app = workflow.build()
-            
-            # Handle string inputs gracefully
-            if isinstance(task.input_payload, dict):
-                objective = task.input_payload.get("prompt", "") or task.input_payload.get("objective", "")
-            else:
-                objective = str(task.input_payload)
-
-            initial_state: AgentState = {
-                "objective": objective,
-                "project_id": str(task.project_id),
-                "task_id": str(task.id),
-                "context": [],
-                "plan": [],
-                "current_step_index": 0,
-                "step_results": [],
-                "step_count": 0,
-                "max_steps": 10,
-                "final_answer": ""
-            }
-
-            logger.info(f"Starting AgentOrchestrator for task {task.id}")
-            
-            # Call ainvoke on the compiled graph, not the wrapper class
-            final_state = await graph_app.ainvoke(initial_state)
-            
+            workflow = WorkflowGraph(
+                self.db,
+                self.redis,
+                self.executor,
+                runtime=self.runtime,
+                router=ModelRouter(),
+                trace_sink=self.trace_sink,
+                approval_gate=self.approval_gate,
+            )
+            final_state = await workflow.build().ainvoke(initial_state)
+            if final_state.get("awaiting_approval"):
+                return {
+                    "status": "requires_approval",
+                    "execution_id": str(execution_id),
+                    "approval_id": final_state.get("approval_id"),
+                    "steps_taken": final_state.get("current_step_index", 0),
+                }
+            if final_state.get("status") == "failed":
+                return {
+                    "status": "failed",
+                    "execution_id": str(execution_id),
+                    "error_detail": final_state.get("failure_reason", "Agent execution failed"),
+                    "steps_taken": final_state.get("current_step_index", 0),
+                    "tool_results": final_state.get("step_results", []),
+                }
             return {
                 "status": "success",
+                "execution_id": str(execution_id),
                 "final_answer": final_state.get("final_answer", ""),
-                "steps_taken": final_state.get("step_count", 0),
-                "tool_results": final_state.get("step_results", [])
+                "steps_taken": final_state.get("current_step_index", 0),
+                "tool_results": final_state.get("step_results", []),
             }
-            
-        except Exception as e:
-            logger.exception(f"Agent Orchestrator failed catastrophically: {e}")
-            return {"status": "error", "error_detail": str(e)}
+        except Exception as exc:
+            logger.exception("Agent orchestration failed safely for task %s", task.id)
+            return {
+                "status": "error",
+                "execution_id": str(execution_id),
+                "error_detail": "Agent execution failed before completion",
+            }

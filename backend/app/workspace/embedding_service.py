@@ -3,14 +3,14 @@ import os
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.workspace.models import DocumentChunk
-from app.models_ai.ollama_provider import OllamaProvider
+from app.models_ai.runtime import OllamaRuntime
 
 logger = logging.getLogger(__name__)
 
 class EmbeddingService:
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.provider = OllamaProvider(base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
+        self.runtime = OllamaRuntime()
         self.embed_model = "nomic-embed-text"
         self.expected_dim = 768 # nomic-embed-text dimension
 
@@ -22,7 +22,7 @@ class EmbeddingService:
         chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
         
         for i, chunk_text in enumerate(chunks):
-            embedding = await self.provider.embed(self.embed_model, chunk_text)
+            embedding = await self.runtime.embed(self.embed_model, chunk_text)
             
             # Step 8.4: Embedding Dimensionality Integrity
             if len(embedding) != self.expected_dim:

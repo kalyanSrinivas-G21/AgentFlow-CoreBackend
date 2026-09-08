@@ -123,7 +123,13 @@ class StreamConsumer:
                         }
                         
                         envelope_json = payload.get("envelope")
-                        envelope = EventEnvelope.model_validate_json(envelope_json)
+                        try:
+                            envelope = EventEnvelope.model_validate_json(envelope_json)
+                        except Exception as exc:
+                            logger.error("Malformed event envelope %s: %s", message_id, exc)
+                            payload["error"] = "malformed_event_envelope"
+                            await self._handle_dlq(stream_name, message_id, payload)
+                            continue
                         
                         idempotency_key = envelope.idempotency_key
                         if await self._check_idempotency(idempotency_key):

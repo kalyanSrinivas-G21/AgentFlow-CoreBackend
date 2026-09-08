@@ -20,7 +20,7 @@ def test_api_unauthorized_rejection():
         headers={"Authorization": "Bearer BAD-TOKEN-123"}
     )
     assert response_invalid.status_code == 401
-    assert "Invalid or missing" in response_invalid.json()["detail"]
+    assert "Invalid token" in response_invalid.json()["detail"]
 
 @pytest.mark.asyncio
 async def test_egress_strict_isolation():

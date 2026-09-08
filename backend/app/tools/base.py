@@ -10,10 +10,18 @@ TOOL_REGISTRY: Dict[str, "Tool"] = {}
 
 class Tool(ABC):
     name: str
+    tool_id: str
     description: str = "No description provided."
     input_schema: Type[BaseModel]
     timeout_s: float = 10.0
     retryable: bool = False
+    permission_level: str = "execute"
+    execution_environment: str = "backend"
+    resource_limits: Dict[str, Any] = {}
+    network_policy: Dict[str, Any] = {"default": "blocked"}
+    supported_task_types: List[str] = []
+    health: str = "available"
+    requires_approval: bool = False
 
     @abstractmethod
     async def run(self, args: Dict[str, Any], project_id: str, db: AsyncSession = None) -> ToolResult:
@@ -30,9 +38,18 @@ def get_tool_catalog() -> List[Dict[str, Any]]:
     catalog = []
     for name, tool in TOOL_REGISTRY.items():
         catalog.append({
+            "tool_id": getattr(tool, "tool_id", name),
             "name": tool.name,
             "description": getattr(tool, 'description', f"Executes {tool.name}"),
-            "parameters": tool.input_schema.model_json_schema()
+            "parameters": tool.input_schema.model_json_schema(),
+            "permission_level": tool.permission_level,
+            "execution_environment": tool.execution_environment,
+            "timeout_seconds": tool.timeout_s,
+            "resource_limits": tool.resource_limits,
+            "network_policy": tool.network_policy,
+            "supported_task_types": tool.supported_task_types,
+            "health": tool.health,
+            "requires_approval": tool.requires_approval,
         })
     return catalog
 

@@ -16,6 +16,7 @@ from app.security.auth import get_current_user, validate_local_endpoint
 
 from app.monitoring.sampler import sample_resources
 from app.monitoring.router import router as monitoring_router
+from app.security.sovereignty_router import router as sovereignty_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -57,4 +58,5 @@ app.include_router(tasks_router, prefix="/api/v1", dependencies=secure_dependenc
 app.include_router(ai_router, prefix="/api/v1/ai", dependencies=secure_dependency)
 app.include_router(workspace_router, dependencies=secure_dependency)
 app.include_router(monitoring_router, tags=["Monitoring"])
+app.include_router(sovereignty_router)
 app.include_router(realtime_router, tags=["Realtime"])

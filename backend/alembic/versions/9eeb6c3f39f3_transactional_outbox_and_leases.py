@@ -37,7 +37,8 @@ def upgrade() -> None:
     op.alter_column('agent_runs', 'tier_used',
                existing_type=sa.VARCHAR(),
                type_=sa.Integer(),
-               nullable=True)
+               nullable=True,
+               postgresql_using="tier_used::integer")
     op.drop_constraint(op.f('agent_runs_task_id_fkey'), 'agent_runs', type_='foreignkey')
     op.create_foreign_key(None, 'agent_runs', 'tasks', ['task_id'], ['id'], ondelete='CASCADE')
     op.drop_column('agent_runs', 'iteration_count')

@@ -14,32 +14,60 @@ async def test_sandbox_cancellation_kills_container(mock_exec):
     """
     from app.sandbox.runner import run_in_sandbox
     
-    # 1. Setup Mock for main docker run process
-    mock_process = MagicMock()
+    # 1. Setup Mock for docker create process
+    mock_create_proc = MagicMock()
+    mock_create_proc.communicate = AsyncMock(return_value=(b"", b""))
+    mock_create_proc.returncode = 0
+    
+    # 2. Setup Mock for docker start process (this will hang to allow cancellation)
+    mock_start_proc = MagicMock()
     
     # Make wait() hang cooperatively so it can be cleanly cancelled
+    cancelled_event = asyncio.Event()
+    
     async def hang_wait():
         try:
-            await asyncio.sleep(5)
+            # Wait for cancellation signal
+            await cancelled_event.wait()
+            raise asyncio.CancelledError()
         except asyncio.CancelledError:
-            pass
+            raise
         return 0
         
-    mock_process.wait = AsyncMock(side_effect=hang_wait)
+    mock_start_proc.wait = AsyncMock(side_effect=hang_wait)
     
-    # Make streams return empty to close the read tasks instantly (preventing infinite loops)
-    mock_process.stdout.read = AsyncMock(return_value=b"")
-    mock_process.stderr.read = AsyncMock(return_value=b"")
+    # Make streams hang to ensure we're in the middle of execution when cancelled
+    async def hang_read():
+        try:
+            await cancelled_event.wait()
+            raise asyncio.CancelledError()
+        except asyncio.CancelledError:
+            raise
+        return b""
     
-    # 2. Setup Mock for the docker rm -f kill process
+    mock_start_proc.stdout = MagicMock()
+    mock_start_proc.stdout.read = AsyncMock(side_effect=hang_read)
+    mock_start_proc.stderr = MagicMock()
+    mock_start_proc.stderr.read = AsyncMock(side_effect=hang_read)
+    mock_start_proc.stdin = MagicMock()
+    mock_start_proc.stdin.write = MagicMock()
+    mock_start_proc.stdin.drain = AsyncMock()
+    mock_start_proc.stdin.close = MagicMock()
+    
+    # 3. Setup Mock for the docker rm -f kill process (used in cancellation handler)
     mock_kill_proc = MagicMock()
     mock_kill_proc.communicate = AsyncMock(return_value=(b"", b""))
     mock_kill_proc.wait = AsyncMock(return_value=0)
     
-    # Sequence: First call returns run proc, second returns kill proc
-    mock_exec.side_effect = [mock_process, mock_kill_proc]
+    # 4. Setup Mock for the docker rm -f cleanup process (used in finally block)
+    mock_cleanup_proc = MagicMock()
+    mock_cleanup_proc.communicate = AsyncMock(return_value=(b"", b""))
+    mock_cleanup_proc.wait = AsyncMock(return_value=0)
     
-    # 3. Execute
+    # Sequence: create, start, kill (cancellation), cleanup (finally)
+    mock_exec.side_effect = [mock_create_proc, mock_start_proc, mock_kill_proc, mock_cleanup_proc]
+    
+    # 5. Execute
     files = {"main.py": "print('Simulation payload')"}
     command = ["python", "main.py"]
     
@@ -50,15 +78,20 @@ async def test_sandbox_cancellation_kills_container(mock_exec):
     
     # Send active cancellation signal
     task.cancel()
+    cancelled_event.set()
     
     with pytest.raises(asyncio.CancelledError):
         await task
         
-    # 4. Verify
-    assert mock_exec.call_count == 2
+    # 6. Verify that docker rm -f was called (cancellation handler)
+    assert mock_exec.call_count >= 3  # create, start, and at least one rm -f
     
-    kill_call = mock_exec.call_args_list[1][0]
+    # Find the docker rm -f call
+    rm_calls = [call for call in mock_exec.call_args_list if call[0][0] == "docker" and call[0][1] == "rm"]
+    assert len(rm_calls) >= 1, "Expected at least one docker rm -f call"
+    
+    kill_call = rm_calls[0][0]
     assert kill_call[0] == "docker"
     assert kill_call[1] == "rm"
     assert kill_call[2] == "-f"
-    assert kill_call[3].startswith("sandbox_")
+    assert kill_call[3].startswith("sandbox_") or kill_call[3].startswith("pytest-sandbox-")

@@ -15,6 +15,7 @@ from app.models_ai.router import ModelRouter
 from app.workspace.embedding_service import EmbeddingService
 from app.workspace.models import DocumentChunk
 from app.workspace.models import File
+from app.workspace.ingestion import process_document, ProcessingStatus
 
 class ExtractInput(BaseModel):
     file_path: str = Field(..., description="Relative path of the document to extract")
@@ -40,10 +41,14 @@ class DocumentExtractTool(Tool):
         # Step 8.3: Direct Native Parsing routing (Saves VRAM)
         mime_type = magic.from_file(str(target), mime=True)
         
-        try:
-            extracted_text = DocumentParserRegistry.parse(target, mime_type)
-        except Exception as e:
-            return ToolResult(success=False, error=f"Parsing failed: {str(e)}")
+        file_row = await db.scalar(select(File).where(File.id == args["file_id"], File.project_id == project_id))
+        if file_row is None:
+            return ToolResult(success=False, error="File does not belong to this project")
+
+        processing = process_document(target, mime_type)
+        if processing.status != ProcessingStatus.COMPLETED:
+            return ToolResult(success=False, error=f"Document status {processing.status}: {processing.failure_reason}")
+        extracted_text = processing.text or ""
         
         embedding_service = EmbeddingService(db)
         await embedding_service.chunk_and_embed(args["file_id"], extracted_text)

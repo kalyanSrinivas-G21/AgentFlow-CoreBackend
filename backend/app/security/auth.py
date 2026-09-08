@@ -13,7 +13,10 @@ from app.security.models import ProjectMember
 
 security = HTTPBearer()
 
-SECRET_KEY = os.getenv("JWT_SECRET", "super-secret-key-change-in-prod")
+# The fallback is a 40-character local-dev-only secret that meets the 32-byte
+# HMAC-SHA256 minimum and eliminates the InsecureKeyLengthWarning.
+# In any real deployment set JWT_SECRET to a 64-byte+ random value via env.
+SECRET_KEY = os.getenv("JWT_SECRET", "local-dev-only-secret-key-not-for-production-use!")
 ALGORITHM = "HS256"
 
 # Step 11.5: Local Endpoint Sovereignty Policy

@@ -4,6 +4,7 @@ import httpx
 from typing import AsyncGenerator, Dict, Any, List
 from app.models_ai.provider_base import ModelProvider
 from app.models_ai.resource_manager import GPUResourceManager, ResourceExhaustedError
+from app.security.auditor import get_application_auditor
 
 class OllamaProvider(ModelProvider):
     def __init__(self, base_url: str = "http://localhost:11434", timeout_s: float = 120.0):
@@ -45,6 +46,11 @@ class OllamaProvider(ModelProvider):
                 payload["images"] = images
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
+                await get_application_auditor().record_request(
+                    self.base_url,
+                    source_component="ollama_provider",
+                    request_classification="local_ai_inference",
+                )
                 response = await client.post(f"{self.base_url}/api/generate", json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -67,6 +73,11 @@ class OllamaProvider(ModelProvider):
                 payload["system"] = system
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
+                await get_application_auditor().record_request(
+                    self.base_url,
+                    source_component="ollama_provider",
+                    request_classification="local_ai_inference",
+                )
                 response = await client.post(f"{self.base_url}/api/generate", json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -86,6 +97,11 @@ class OllamaProvider(ModelProvider):
                 "prompt": text
             }
             async with httpx.AsyncClient(timeout=self.timeout) as client:
+                await get_application_auditor().record_request(
+                    self.base_url,
+                    source_component="ollama_provider",
+                    request_classification="local_ai_inference",
+                )
                 response = await client.post(f"{self.base_url}/api/embeddings", json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -107,6 +123,11 @@ class OllamaProvider(ModelProvider):
                 payload["system"] = system
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
+                await get_application_auditor().record_request(
+                    self.base_url,
+                    source_component="ollama_provider",
+                    request_classification="local_ai_inference",
+                )
                 async with client.stream("POST", f"{self.base_url}/api/generate", json=payload) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():

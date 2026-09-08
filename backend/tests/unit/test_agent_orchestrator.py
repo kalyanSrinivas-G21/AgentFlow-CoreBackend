@@ -1,9 +1,10 @@
 # backend/tests/unit/test_agent_orchestrator.py
 import pytest
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+import os
+from unittest.mock import AsyncMock, MagicMock, patch
 from app.agents.orchestrator import AgentOrchestrator
-from app.agents.validator import ValidationResult
+from app.tools.models import ToolResult
 
 async def mock_db_refresh(obj):
     """Simulate SQLAlchemy populating the ID after a commit/refresh."""
@@ -23,28 +24,26 @@ async def test_agent_orchestrator_success():
     
     task_mock = MagicMock()
     task_mock.id = uuid.uuid4()
+    task_mock.project_id = uuid.uuid4()
     task_mock.status = "RUNNING"
     task_mock.input_payload = {"prompt": "Do something"}
 
-    orchestrator = AgentOrchestrator(db_mock, redis_mock)
-    
-    # Mock Planner to return 1 step
-    orchestrator.planner.plan = AsyncMock(return_value={
-        "steps": [{"tool": "mock_tool", "tool_args": {"key": "val"}}]
-    })
-    
-    # Mock Executor
-    orchestrator.executor.execute_step = AsyncMock()
-    
-    # Mock Validator to PASS
-    orchestrator.validator.validate = AsyncMock(return_value=ValidationResult(passed=True, reason="ok"))
+    executor_mock = AsyncMock()
+    executor_mock.execute_step = AsyncMock(return_value=ToolResult(success=True, output="Mock output"))
 
-    result = await orchestrator.run(task_mock)
+    orchestrator = AgentOrchestrator(db_mock, redis_mock, executor=executor_mock)
+    
+    # Mock the LLM responses to simulate a successful single-step execution
+    with patch("app.models_ai.ollama_provider.OllamaProvider.generate") as mock_generate:
+        mock_generate.side_effect = [
+            '{"steps": [{"tool": "mock_tool", "tool_args": {"key": "val"}}], "reasoning": "Test step"}', # Plan
+            'COMPLETE' # Reason
+        ]
+        
+        result = await orchestrator.run(task_mock)
     
     assert result["status"] == "success"
-    assert orchestrator.planner.plan.call_count == 1
-    assert orchestrator.executor.execute_step.call_count == 1
-    assert orchestrator.validator.validate.call_count == 1
+    assert executor_mock.execute_step.call_count == 1
 
 @pytest.mark.asyncio
 async def test_agent_orchestrator_retry_then_pass():
@@ -53,30 +52,29 @@ async def test_agent_orchestrator_retry_then_pass():
     
     task_mock = MagicMock()
     task_mock.id = uuid.uuid4()
+    task_mock.project_id = uuid.uuid4()
     task_mock.status = "RUNNING"
     task_mock.input_payload = {"prompt": "Do something"}
 
-    orchestrator = AgentOrchestrator(db_mock, redis_mock)
-    orchestrator.planner.plan = AsyncMock(return_value={
-        "steps": [{"tool": "mock_tool", "tool_args": {}}]
-    })
-    orchestrator.executor.execute_step = AsyncMock()
-    
-    # Validator fails first time, passes second time
-    orchestrator.validator.validate = AsyncMock(side_effect=[
-        ValidationResult(passed=False, reason="Missing info"),
-        ValidationResult(passed=True, reason="Looks good now")
-    ])
+    executor_mock = AsyncMock()
+    executor_mock.execute_step = AsyncMock(return_value=ToolResult(success=True, output="Mock output"))
 
-    result = await orchestrator.run(task_mock)
+    orchestrator = AgentOrchestrator(db_mock, redis_mock, executor=executor_mock)
+    
+    # Mock the LLM responses to simulate a retry scenario
+    with patch("app.models_ai.ollama_provider.OllamaProvider.generate") as mock_generate:
+        mock_generate.side_effect = [
+            '{"steps": [{"tool": "mock_tool", "tool_args": {}}], "reasoning": "Test step"}', # Plan 1
+            'CONTINUE: Need more info', # Reason 1 - triggers retry
+            '{"steps": [{"tool": "mock_tool", "tool_args": {}}], "reasoning": "Test step again"}', # Plan 2
+            'COMPLETE' # Reason 2
+        ]
+        
+        result = await orchestrator.run(task_mock)
     
     assert result["status"] == "success"
-    # Should have planned twice (1 retry)
-    assert orchestrator.planner.plan.call_count == 2
-    # Second plan call should have received the prior failure
-    orchestrator.planner.plan.assert_called_with("Do something", "Missing info")
-    assert orchestrator.executor.execute_step.call_count == 2
-    assert orchestrator.validator.validate.call_count == 2
+    # Should have executed 2 steps (1 retry)
+    assert executor_mock.execute_step.call_count == 2
 
 @pytest.mark.asyncio
 async def test_agent_orchestrator_hard_cap():
@@ -85,20 +83,37 @@ async def test_agent_orchestrator_hard_cap():
     
     task_mock = MagicMock()
     task_mock.id = uuid.uuid4()
+    task_mock.project_id = uuid.uuid4()
     task_mock.status = "RUNNING"
     task_mock.input_payload = {"prompt": "Do something"}
 
-    orchestrator = AgentOrchestrator(db_mock, redis_mock)
-    
-    # Planner returns 10 steps (above the cap of 6)
-    orchestrator.planner.plan = AsyncMock(return_value={
-        "steps": [{"tool": f"tool_{i}", "tool_args": {}} for i in range(10)]
-    })
-    orchestrator.executor.execute_step = AsyncMock()
-    orchestrator.validator.validate = AsyncMock(return_value=ValidationResult(passed=True, reason="ok"))
+    executor_mock = AsyncMock()
+    executor_mock.execute_step = AsyncMock(return_value=ToolResult(success=True, output="Mock output"))
 
-    result = await orchestrator.run(task_mock)
+    # Set a low max steps for testing
+    os.environ["AGENT_MAX_STEPS"] = "3"
     
-    assert result["status"] == "success"
-    # Executor should have only been called 6 times due to the hard cap
-    assert orchestrator.executor.execute_step.call_count == 6
+    orchestrator = AgentOrchestrator(db_mock, redis_mock, executor=executor_mock)
+    
+    # Mock the LLM responses to simulate many steps
+    with patch("app.models_ai.ollama_provider.OllamaProvider.generate") as mock_generate:
+        # Plan 1, Continue, Plan 2, Continue, Plan 3, Continue, Plan 4, Continue (should hit cap)
+        mock_generate.side_effect = [
+            '{"steps": [{"tool": "tool_1", "tool_args": {}}], "reasoning": "Step 1"}',
+            'CONTINUE',
+            '{"steps": [{"tool": "tool_2", "tool_args": {}}], "reasoning": "Step 2"}',
+            'CONTINUE',
+            '{"steps": [{"tool": "tool_3", "tool_args": {}}], "reasoning": "Step 3"}',
+            'CONTINUE',
+            '{"steps": [{"tool": "tool_4", "tool_args": {}}], "reasoning": "Step 4"}',
+            'CONTINUE',
+        ]
+        
+        result = await orchestrator.run(task_mock)
+    
+    # Should fail due to step limit
+    assert result["status"] == "failed"
+    assert "step" in result.get("error_detail", "").lower() or "limit" in result.get("error_detail", "").lower()
+    
+    # Clean up
+    del os.environ["AGENT_MAX_STEPS"]

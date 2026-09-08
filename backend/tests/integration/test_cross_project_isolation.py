@@ -6,7 +6,7 @@ import os
 from fastapi import HTTPException
 from app.security.auth import verify_project_access
 
-SECRET_KEY = os.getenv("JWT_SECRET", "super-secret-key-change-in-prod")
+SECRET_KEY = os.getenv("JWT_SECRET", "local-dev-only-secret-key-not-for-production-use!")
 ALGORITHM = "HS256"
 
 pytestmark = pytest.mark.asyncio

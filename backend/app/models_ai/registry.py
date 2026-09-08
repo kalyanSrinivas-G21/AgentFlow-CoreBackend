@@ -11,7 +11,14 @@ class ModelDescriptor(BaseModel):
 
 # Static registry for a 6GB VRAM target architecture (e.g., RTX 4050)
 # NVML admission control in Phase 9 will use these static estimates.
+# NOTE: qwen3:8b is included as it is the default model loaded in the
+# development environment.  Add or remove entries to match locally pulled models.
 _REGISTRY = {
+    "qwen3:8b": ModelDescriptor(
+        model_id="qwen3:8b",
+        capabilities=["tool_calling", "general"],
+        estimated_vram_mb=5000  # ~5 GB quantized Q4_K_M
+    ),
     "llama3.1:8b": ModelDescriptor(
         model_id="llama3.1:8b",
         capabilities=["tool_calling", "general"],
